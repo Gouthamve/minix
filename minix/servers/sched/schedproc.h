@@ -30,6 +30,12 @@ EXTERN struct schedproc {
 	unsigned priority;		/* the process' current priority */
 	unsigned time_slice;		/* this process's time slice */
 	unsigned cpu;		/* what CPU is the process running on */
+  unsigned deadline;
+  unsigned long long waiting_time;
+  unsigned long long start_time;
+  u64_t start_tsc;
+  u64_t last_tsc;
+
 	bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is the
 								process allowed
 								to run on */

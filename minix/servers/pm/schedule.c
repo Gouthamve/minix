@@ -110,3 +110,4 @@ int sched_nice(struct mproc *rmp, int nice)
 
 	return (OK);
 }
+

@@ -10,7 +10,7 @@ set -e
 : ${OBJ=../obj.${ARCH}}
 : ${CROSS_TOOLS=${OBJ}/"tooldir.`uname -s`-`uname -r`-`uname -m`"/bin}
 : ${CROSS_PREFIX=${CROSS_TOOLS}/i586-elf32-minix-}
-: ${JOBS=1}
+: ${JOBS=7}
 : ${DESTDIR=${OBJ}/destdir.$ARCH}
 : ${RELEASETOOLSDIR=./releasetools/}
 : ${FSTAB=${DESTDIR}/etc/fstab}

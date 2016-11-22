@@ -1,0 +1,539 @@
+diff --git a/include/unistd.h b/include/unistd.h
+index 9d13199..ae61eb0 100644
+--- a/include/unistd.h
++++ b/include/unistd.h
+@@ -411,5 +411,7 @@ extern	 int optreset;		/* getopt(3) external variable */
+ extern	 char *suboptarg;	/* getsubopt(3) external variable */
+ #endif
+ 
++int setdl(long deadline);
++
+ __END_DECLS
+ #endif /* !_UNISTD_H_ */
+diff --git a/minix/include/minix/callnr.h b/minix/include/minix/callnr.h
+index 6030687..a01c548 100644
+--- a/minix/include/minix/callnr.h
++++ b/minix/include/minix/callnr.h
+@@ -58,8 +58,9 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
++#define PM_SETDL		(PM_BASE + 69)
+ 
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define NR_PM_CALLS		49	/* highest number from base plus one */
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff --git a/minix/include/minix/config.h b/minix/include/minix/config.h
+index 3b9eb17..ee499af 100644
+--- a/minix/include/minix/config.h
++++ b/minix/include/minix/config.h
+@@ -59,7 +59,7 @@
+ /* Scheduling priorities. Values must start at zero (highest
+  * priority) and increment.
+  */
+-#define NR_SCHED_QUEUES   16	/* MUST equal minimum priority + 1 */
++#define NR_SCHED_QUEUES   17	/* MUST equal minimum priority + 1 */
+ #define TASK_Q		   0	/* highest, used for kernel tasks */
+ #define MAX_USER_Q  	   0    /* highest priority for user processes */   
+ #define USER_Q  	  ((MIN_USER_Q - MAX_USER_Q) / 2 + MAX_USER_Q) /* default
+diff --git a/minix/kernel/priv.h b/minix/kernel/priv.h
+index 0bdd009..a296f31 100644
+--- a/minix/kernel/priv.h
++++ b/minix/kernel/priv.h
+@@ -15,8 +15,8 @@
+ #include <minix/com.h>
+ #include <minix/const.h>
+ #include <minix/priv.h>
+-#include "kernel/const.h"
+-#include "kernel/type.h"
++#include "const.h"
++#include "type.h"
+ 
+ struct priv {
+   proc_nr_t s_proc_nr;		/* number of associated process */
+diff --git a/minix/servers/pm/Makefile b/minix/servers/pm/Makefile
+index 75f4c54..25de330 100644
+--- a/minix/servers/pm/Makefile
++++ b/minix/servers/pm/Makefile
+@@ -4,7 +4,7 @@
+ PROG=	pm
+ SRCS=	main.c forkexit.c exec.c time.c alarm.c \
+ 	signal.c utility.c table.c trace.c getset.c misc.c \
+-	profile.c mcontext.c schedule.c
++	profile.c mcontext.c schedule.c 
+ 
+ DPADD+=	${LIBSYS} ${LIBTIMERS}
+ LDADD+=	-lsys -ltimers
+diff --git a/minix/servers/pm/proto.h b/minix/servers/pm/proto.h
+index 0d27fc8..f91b3ea 100644
+--- a/minix/servers/pm/proto.h
++++ b/minix/servers/pm/proto.h
+@@ -51,7 +51,7 @@ int do_getrusage(void);
+ void sched_init(void);
+ int sched_start_user(endpoint_t ep, struct mproc *rmp);
+ int sched_nice(struct mproc *rmp, int nice);
+-
++int do_setdl();
+ /* profile.c */
+ int do_sprofile(void);
+ int do_cprofile(void);
+diff --git a/minix/servers/pm/schedule.c b/minix/servers/pm/schedule.c
+index 11b7025..0eb9ce4 100644
+--- a/minix/servers/pm/schedule.c
++++ b/minix/servers/pm/schedule.c
+@@ -110,3 +110,4 @@ int sched_nice(struct mproc *rmp, int nice)
+ 
+ 	return (OK);
+ }
++
+diff --git a/minix/servers/sched/schedproc.h b/minix/servers/sched/schedproc.h
+index a368f37..b7c1fdd 100644
+--- a/minix/servers/sched/schedproc.h
++++ b/minix/servers/sched/schedproc.h
+@@ -30,6 +30,12 @@ EXTERN struct schedproc {
+ 	unsigned priority;		/* the process' current priority */
+ 	unsigned time_slice;		/* this process's time slice */
+ 	unsigned cpu;		/* what CPU is the process running on */
++  unsigned deadline;
++  unsigned long long waiting_time;
++  unsigned long long start_time;
++  u64_t start_tsc;
++  u64_t last_tsc;
++
+ 	bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is the
+ 								process allowed
+ 								to run on */
+diff --git a/minix/servers/sched/schedule.c b/minix/servers/sched/schedule.c
+index 6fac2fb..36616ef 100644
+--- a/minix/servers/sched/schedule.c
++++ b/minix/servers/sched/schedule.c
+@@ -12,16 +12,45 @@
+ #include <assert.h>
+ #include <minix/com.h>
+ #include <machine/archtypes.h>
+-#include "kernel/proc.h" /* for queue constants */
++#include "../../kernel/proc.h" /* for queue constants */
++#include <stdlib.h>
++#include <sys/resource.h>
+ 
+ static minix_timer_t sched_timer;
+ static unsigned balance_timeout;
+ 
+ #define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
+ 
++#define DEFAULT_QUEUE 7
++
++#ifndef PRIO_MIN
++#define PRIO_MIN -20
++#endif
++#ifndef PRIO_MAX
++#define PRIO_MAX 20
++#endif
++#ifndef SCHED_EDF
++#define SCHED_EDF 1
++#endif
++ 
+ static int schedule_process(struct schedproc * rmp, unsigned flags);
+ static void balance_queues(minix_timer_t *tp);
+ 
++int SAME_sched_noquantum(struct schedproc *rmp, int pid);
++int NEW_sched_noquantum(struct schedproc *rmp, int pid);
++int sched_start_scheduling(struct schedproc *rmp, int pid);
++int sched_stop_scheduling(struct schedproc *rmp, int pid);
++int sched_start_scheduling2(struct schedproc *rmp, int pid);
++int sched_start_scheduling3(struct schedproc *rmp, int pid);
++int sched_do_nice1(struct schedproc *rmp, int pid);
++int sched_balance_queues(struct schedproc *rmp, int pid);
++int do_edf();
++int do_setdl(message *m_ptr);
++int choose_scheduler(message *m_ptr);
++int do_getsystime(message *m_ptr);
++
++static long cur_edf_clock;
++
+ #define SCHEDULE_CHANGE_PRIO	0x1
+ #define SCHEDULE_CHANGE_QUANTUM	0x2
+ #define SCHEDULE_CHANGE_CPU	0x4
+@@ -43,6 +72,10 @@ static void balance_queues(minix_timer_t *tp);
+ 
+ #define DEFAULT_USER_TIME_SLICE 200
+ 
++// Global constant to choose Preemptive / Non-preemptive scheduling.
++// 0 - Premptive , 1 - Non-preemptive.
++int sched_type=0;
++
+ /* processes created by RS are sysytem processes */
+ #define is_system_proc(p)	((p)->parent == RS_PROC_NR)
+ 
+@@ -99,13 +132,26 @@ int do_noquantum(message *m_ptr)
+ 	}
+ 
+ 	rmp = &schedproc[proc_nr_n];
+-	if (rmp->priority < MIN_USER_Q) {
+-		rmp->priority += 1; /* lower priority */
+-	}
+ 
+-	if ((rv = schedule_process_local(rmp)) != OK) {
+-		return rv;
+-	}
++  // Check if it is an RT Process.
++  // Basically, if the priority belongs to newly added queue number (16).
++  if(rmp->priority<=MIN_USER_Q && rmp->priority>=MAX_USER_Q){
++    SAME_sched_noquantum(rmp, proc_nr_n);
++  }
++  else if(rmp->priority < MAX_USER_Q -1){
++    // Increasing priority does not bring it to the RT queue.
++		rmp->priority += 1; /* lower priority by incrementing queue number */
++  }
++
++  // Schedule locally if not RT process.
++	if (rmp->priority <= MAX_USER_Q -1) {
++    if ((rv = schedule_process_local(rmp)) != OK) {
++      return rv;
++    }
++  }else if(rv==(NEW_sched_noquantum(rmp,proc_nr_n))!=OK){
++    return rv;
++  }
++
+ 	return OK;
+ }
+ 
+@@ -133,8 +179,8 @@ int do_stop_scheduling(message *m_ptr)
+ 	cpu_proc[rmp->cpu]--;
+ #endif
+ 	rmp->flags = 0; /*&= ~IN_USE;*/
+-
+-	return OK;
++// TODO
++  return sched_stop_scheduling(rmp, proc_nr_n);
+ }
+ 
+ /*===========================================================================*
+@@ -164,6 +210,15 @@ int do_start_scheduling(message *m_ptr)
+ 	rmp->endpoint     = m_ptr->m_lsys_sched_scheduling_start.endpoint;
+ 	rmp->parent       = m_ptr->m_lsys_sched_scheduling_start.parent;
+ 	rmp->max_priority = m_ptr->m_lsys_sched_scheduling_start.maxprio;
++  // TODO
++  // Set a new processes deadline to inf.
++  rmp->deadline = cur_edf_clock+100000000;
++  // Schedule it immediately.
++  rmp->waiting_time = 0;
++  // Update timeslices.
++  read_tsc_64(&(rmp->last_tsc));
++  rmp->start_tsc = rmp->last_tsc;
++
+ 	if (rmp->max_priority >= NR_SCHED_QUEUES) {
+ 		return EINVAL;
+ 	}
+@@ -174,8 +229,11 @@ int do_start_scheduling(message *m_ptr)
+ 	if (rmp->endpoint == rmp->parent) {
+ 		/* We have a special case here for init, which is the first
+ 		   process scheduled, and the parent of itself. */
+-		rmp->priority   = USER_Q;
++		//rmp->priority   = USER_Q;
++		rmp->priority   = DEFAULT_QUEUE;
+ 		rmp->time_slice = DEFAULT_USER_TIME_SLICE;
++    // TODO
++    //sched_start_scheduling(rmp, 0);
+ 
+ 		/*
+ 		 * Since kernel never changes the cpu of a process, all are
+@@ -195,7 +253,11 @@ int do_start_scheduling(message *m_ptr)
+ 		/* We have a special case here for system processes, for which
+ 		 * quanum and priority are set explicitly rather than inherited 
+ 		 * from the parent */
+-		rmp->priority   = rmp->max_priority;
++    // TODO
++    // We will not set priority to max.
++    // Instead we will a default value decided - DEFAULT_QUEUE.
++    sched_start_scheduling2(rmp, 0);
++		//rmp->priority   = rmp->max_priority;
+ 		rmp->time_slice = m_ptr->m_lsys_sched_scheduling_start.quantum;
+ 		break;
+ 		
+@@ -207,12 +269,13 @@ int do_start_scheduling(message *m_ptr)
+ 				&parent_nr_n)) != OK)
+ 			return rv;
+ 
+-		rmp->priority = schedproc[parent_nr_n].priority;
+-		rmp->time_slice = schedproc[parent_nr_n].time_slice;
++    // TODO
++    sched_start_scheduling3(rmp, 0);
++		// rmp->priority = schedproc[parent_nr_n].priority;
++		// rmp->time_slice = schedproc[parent_nr_n].time_slice;
+ 		break;
+ 		
+ 	default: 
+-		/* not reachable */
+ 		assert(0);
+ 	}
+ 
+@@ -272,7 +335,9 @@ int do_nice(message *m_ptr)
+ 	}
+ 
+ 	rmp = &schedproc[proc_nr_n];
++  // TODO
+ 	new_q = m_ptr->m_pm_sched_scheduling_set_nice.maxprio;
++  sched_do_nice1(rmp, m_ptr->m_pm_sched_scheduling_set_nice.maxprio);
+ 	if (new_q >= NR_SCHED_QUEUES) {
+ 		return EINVAL;
+ 	}
+@@ -280,6 +345,7 @@ int do_nice(message *m_ptr)
+ 	/* Store old values, in case we need to roll back the changes */
+ 	old_q     = rmp->priority;
+ 	old_max_q = rmp->max_priority;
++  //sched_do_nice2(rmp, m_ptr->m_pm_sched_scheduling_set_nice.maxprio);
+ 
+ 	/* Update the proc entry and reschedule the process */
+ 	rmp->max_priority = rmp->priority = new_q;
+@@ -290,7 +356,7 @@ int do_nice(message *m_ptr)
+ 		rmp->priority     = old_q;
+ 		rmp->max_priority = old_max_q;
+ 	}
+-
++  //sched_do_nice3(rmp, m_ptr->m_pm_sched_scheduling_set_nice.maxprio);
+ 	return rv;
+ }
+ 
+@@ -338,8 +404,16 @@ void init_scheduling(void)
+ 	balance_timeout = BALANCE_TIMEOUT * sys_hz();
+ 	init_timer(&sched_timer);
+ 	set_timer(&sched_timer, balance_timeout, balance_queues, 0);
++  // TODO
++  // Add params to make EDF workflow.
++  cur_edf_clock = 0;
++  // For measuring time slice.
++  u64_t r;
++  read_tsc_64(&r);
++  srandom((unsigned)r);
+ }
+ 
++
+ /*===========================================================================*
+  *				balance_queues				     *
+  *===========================================================================*/
+@@ -356,12 +430,205 @@ static void balance_queues(minix_timer_t *tp)
+ 
+ 	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
+ 		if (rmp->flags & IN_USE) {
+-			if (rmp->priority > rmp->max_priority) {
+-				rmp->priority -= 1; /* increase priority */
+-				schedule_process_local(rmp);
+-			}
++      // TODO
++      sched_balance_queues(rmp,0);
+ 		}
+ 	}
+ 
+ 	set_timer(&sched_timer, balance_timeout, balance_queues, 0);
+ }
++
++int do_setdl(message *m_ptr){
++  struct schedproc *rmp;
++
++  /* Standard Sanity check.*/
++
++  /* check who can send you requests */
++  if (!accept_message(m_ptr))
++    return EPERM;
++
++  /* Get value of proc_nr_n */
++  int proc_nr_n;
++  if (sched_isokendpt(m_ptr->m2_l1, &proc_nr_n) != OK) {
++    printf("SCHED: WARNING: got an invalid endpoint in OOQ msg "
++    "%ld\n", m_ptr->m2_l1);
++    return EBADEPT;
++  }
++
++  rmp = &schedproc[proc_nr_n];
++  int old_dl;
++  old_dl = rmp->deadline;
++  rmp->priority = USER_Q;
++  /*Set flags carefully. If they're not defined, set them to SCHED_EDF. */
++  rmp->flags = rmp->flags | SCHED_EDF;
++  rmp->deadline = m_ptr->m2_l1;
++
++  printf("SCHED: System call do_setdl called with deadline value: %ld\n", m_ptr->m2_l1);
++  do_edf();
++  return OK;
++}
++
++// From do_noquantum. 
++// This function has two main operations.
++// 1. Every time a process finishes its quantum, we need to decide what we want to do with it.
++//    Schedule it again / put it in a different queue etc.
++// 2. Everytime a process calls this function, it means that one quantum is complete
++//    and hence the global edf time must be increased.
++
++int SAME_sched_noquantum(struct schedproc *rmp, int pid){
++  printf("SCHED : Quantum expired in process %d in queue %d\n", pid,rmp->priority);
++  u64_t current_tsc;
++  read_tsc_64(&current_tsc);
++  rmp->waiting_time = rmp->waiting_time+((current_tsc - rmp->last_tsc)-
++      (rmp->time_slice*sys_hz()/1000));
++  rmp->last_tsc=current_tsc;
++  cur_edf_clock += 1;
++  rmp->priority=USER_Q; /* Run the same process. Put it back in USER_Q */
++  return OK;
++}
++
++int NEW_sched_noquantum(struct schedproc *rmp, int pid){
++  printf("SCHED : Quantum expired in process %d in queue %d\n", pid,rmp->priority);
++  u64_t current_tsc;
++  read_tsc_64(&current_tsc);
++  rmp->waiting_time = rmp->waiting_time+((current_tsc - rmp->last_tsc)-
++      (rmp->time_slice*sys_hz()/1000));
++  rmp->last_tsc=current_tsc;
++  cur_edf_clock += 1;
++  if(sched_type==0)
++    return do_edf(); /* Let another process with earliest deadline run.  */
++  else{
++    /*Non preemptive version, let the same process run.*/
++    schedule_process_local(rmp);
++  }
++  return OK;
++}
++
++int sched_stop_scheduling(struct schedproc *rmp, int pid){
++  if(rmp->priority>=MAX_USER_Q && rmp->priority<=MIN_USER_Q){
++    printf("SCHED : Waiting time of process %d is %llu\n",pid,rmp->waiting_time);
++    u64_t current_tsc;
++    read_tsc_64(&current_tsc);
++    u64_t turn_around_time = ((current_tsc - rmp->start_tsc)-
++      (rmp->time_slice*sys_hz()/1000));
++    printf("SCHED : Turnaround time of process %d is %llu\n",pid,turn_around_time);
++  }
++  /*Bring new process in.*/
++  return do_edf(); 
++}
++
++int sched_start_scheduling(struct schedproc *rmp, int pid){
++  /* Give it default prio. Default time slice.*/
++  rmp->priority = DEFAULT_QUEUE;
++  rmp->time_slice = DEFAULT_USER_TIME_SLICE;
++  return OK;
++}
++
++int sched_start_scheduling2(struct schedproc *rmp, int pid){
++  /* Give it default prio. Also, prio cannot drop below DEFAULT_QUEUE queue.*/
++  rmp->priority = DEFAULT_QUEUE;
++  rmp->max_priority=DEFAULT_QUEUE;
++  return OK;
++}
++
++int sched_start_scheduling3(struct schedproc *rmp, int pid){
++  /* RT process. Give it prio USER_Q-1. 
++   * Process must stay within the user queues.*/
++  rmp->priority = (USER_Q)-1;
++  rmp->time_slice = 200;
++  rmp->max_priority = MAX_USER_Q;
++  return OK;
++}
++
++int sched_do_nice1(struct schedproc *rmp, int pid){
++  if(rmp->priority >=MAX_USER_Q && rmp->priority<=MIN_USER_Q)
++    /* Tell the process that it needs to be put into USER_Q because its an RT.*/
++    return USER_Q; 
++  else{ 
++    if (pid < PRIO_MIN || pid > PRIO_MAX) 
++      return DEFAULT_QUEUE;
++
++    // Pretty straightforward stuff.
++    int new_q_default = (pid-PRIO_MIN) * 2 * DEFAULT_QUEUE / (PRIO_MAX-PRIO_MIN+1);
++
++    /* Non-executable conditions. */
++    if ((signed) new_q_default < MAX_USER_Q) new_q_default = MAX_USER_Q;
++    if (new_q_default > MIN_USER_Q) new_q_default = MIN_USER_Q;
++
++    return new_q_default;
++  }
++
++}
++
++int sched_balance_queues(struct schedproc *rmp, int pid){
++  /* If its a non RT process, then you just increase priority (by decreasing queue number) */
++  /*Cuz thats how a multi level queue works.*/
++  if(rmp->priority > 1 && rmp->priority < MAX_USER_Q){
++    rmp->priority -= 1;
++    schedule_process_local(rmp);
++  }
++  return OK;
++}
++
++/*===========================================================================*
++ *				do_edf					     *
++ *===========================================================================*/
++
++int do_edf(){
++  struct schedproc *rmp = NULL;
++  long max_edf = 10000000;
++  int start=-1;
++  
++  //for(int i=0; i<proc_nr_n; i++)
++  // proc_nr_n gives currently executing ones. We want maximum number of processes.
++  for(int i=0; i<NR_PROCS; i++){
++    rmp = &(schedproc[i]);
++    // Flags are set. IN_USE is active. Only then it quualifies for the check.
++    if((rmp->flags & IN_USE) && (SCHED_EDF) && (rmp->priority >= MAX_USER_Q)){
++      if(rmp->deadline < cur_edf_clock){
++        printf("SCHED : Deadline missed for process: %d, hence, not scheduled.", i);
++        rmp->priority = MAX_USER_Q -1;
++        rmp->max_priority = MAX_USER_Q -1;
++      }
++      else if(rmp->deadline < max_edf){
++        max_edf = rmp->deadline;
++        start = i;
++      }
++    }
++  }
++  if(start == -1){
++    /*No process to be scheduled.*/
++    printf("SCHED : No valid process to schedule.");
++  }else{
++    rmp = &(schedproc[start]);
++    schedule_process_local(rmp);
++  }
++  return OK;
++}
++
++/*===========================================================================*
++ *				choose_scheduler					     *
++ *===========================================================================*/
++
++int choose_scheduler(message *m_ptr){
++
++  // Choose to pass the scheduler type as message argument.
++  // 0 - Preemptive, 1 - Non-preemptive.
++  sched_type = m_ptr->m1_i1;
++  if(sched_type==1){
++    printf("SCHED: Scheduler type assigned as Non-preemptive.");
++  }else if(sched_type==0){
++    printf("SCHED: Scheduler type assigned as Preemptive.");
++  }
++  return 0;
++}
++
++
++/*===========================================================================*
++ *				Setting up Syscall getsystime.					     *
++ *===========================================================================*/
++
++int do_getsystime(message *m_ptr){
++  m_ptr->m2_l1 = cur_edf_clock;
++  return OK;
++}
+diff --git a/releasetools/x86_hdimage.sh b/releasetools/x86_hdimage.sh
+index dd9ccd9..2a8a0eb 100755
+--- a/releasetools/x86_hdimage.sh
++++ b/releasetools/x86_hdimage.sh
+@@ -10,7 +10,7 @@ set -e
+ : ${OBJ=../obj.${ARCH}}
+ : ${CROSS_TOOLS=${OBJ}/"tooldir.`uname -s`-`uname -r`-`uname -m`"/bin}
+ : ${CROSS_PREFIX=${CROSS_TOOLS}/i586-elf32-minix-}
+-: ${JOBS=1}
++: ${JOBS=7}
+ : ${DESTDIR=${OBJ}/destdir.$ARCH}
+ : ${RELEASETOOLSDIR=./releasetools/}
+ : ${FSTAB=${DESTDIR}/etc/fstab}

@@ -411,5 +411,7 @@ extern	 int optreset;		/* getopt(3) external variable */
 extern	 char *suboptarg;	/* getsubopt(3) external variable */
 #endif
 
+int setdl(long deadline);
+
 __END_DECLS
 #endif /* !_UNISTD_H_ */
